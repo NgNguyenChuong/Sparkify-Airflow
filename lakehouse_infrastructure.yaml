@@ -1,0 +1,423 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Networking
+        Parameters:
+          - VpcId
+          - SubnetId
+
+Parameters:
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where Glue jobs will run (use your default VPC)
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet where Glue jobs will run (must have internet access or S3 VPC endpoint)
+
+Resources:
+
+  LakehouseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-lakehouse-dev-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionRawToIA
+            Status: Enabled
+            Prefix: raw/
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+          - Id: TransitionRawToGlacier
+            Status: Enabled
+            Prefix: raw/
+            Transitions:
+              - TransitionInDays: 365
+                StorageClass: GLACIER
+      Tags:
+        - Key: Environment
+          Value: dev
+        - Key: Purpose
+          Value: lakehouse
+
+  LakehouseBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LakehouseBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt LakehouseBucket.Arn
+              - !Sub '${LakehouseBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ── Glue networking ──────────────────────────────────────────────────────────
+  # Glue Spark jobs require a security group with a self-referencing ALL traffic
+  # inbound rule so the driver and executor nodes can communicate with each other.
+  # Without this, executors fail to connect to the driver and the job crashes.
+
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: dev-glue-sg
+      GroupDescription: Glue job security group - self-referencing rule allows Spark driver/executor communication
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Environment
+          Value: dev
+
+  GlueSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GlueSecurityGroup
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref GlueSecurityGroup
+      Description: Allow all traffic within the Glue security group (Spark driver/executor comms)
+
+  # Glue network connection — references the VPC, subnet, and security group.
+  # Glue jobs reference this connection by name to run in the correct network context.
+  GlueNetworkConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: dev-glue-network
+        Description: Network connection for Glue jobs — provides VPC/subnet/security group context
+        ConnectionType: NETWORK
+        PhysicalConnectionRequirements:
+          SubnetId: !Ref SubnetId
+          SecurityGroupIdList:
+            - !Ref GlueSecurityGroup
+          AvailabilityZone: !Select [0, !GetAZs '']
+
+  # ── IAM roles ────────────────────────────────────────────────────────────────
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dev-lakehouse-glue-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: LakehouseS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt LakehouseBucket.Arn
+                  - !Sub '${LakehouseBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+
+  AnalyticsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dev-lakehouse-analytics-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: athena.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LakehouseAnalyticsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt LakehouseBucket.Arn
+                  - !Sub '${LakehouseBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                Resource: '*'
+
+  # ── Lake Formation ───────────────────────────────────────────────────────────
+
+  LakeFormationSettings:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !Sub 'arn:aws:iam::${AWS::AccountId}:role/voclabs'
+        - DataLakePrincipalIdentifier: !GetAtt GlueServiceRole.Arn
+
+  LakeFormationS3Location:
+    Type: AWS::LakeFormation::Resource
+    DependsOn: LakehouseBucket
+    Properties:
+      ResourceArn: !Sub 'arn:aws:s3:::${LakehouseBucket}/'
+      UseServiceLinkedRole: true
+
+  # ── Crawler classifiers ──────────────────────────────────────────────────────
+
+  CsvClassifier:
+    Type: AWS::Glue::Classifier
+    Properties:
+      CsvClassifier:
+        Name: csv_classifier
+        QuoteSymbol: '"'
+        Delimiter: ','
+        ContainsHeader: PRESENT
+
+  # ── Glue databases ───────────────────────────────────────────────────────────
+
+  GlueDatabaseRaw:
+    Type: AWS::Glue::Database
+    DependsOn:
+      - LakeFormationS3Location
+      - LakeFormationSettings
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: raw
+        Description: Bronze layer — raw ingested data, unmodified
+
+  GlueDatabaseTransactions:
+    Type: AWS::Glue::Database
+    DependsOn:
+      - LakeFormationS3Location
+      - LakeFormationSettings
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: transactions
+        Description: Silver layer — normalized transactional data
+
+  GlueDatabaseAnalytics:
+    Type: AWS::Glue::Database
+    DependsOn:
+      - LakeFormationS3Location
+      - LakeFormationSettings
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: analytics
+        Description: Gold layer — aggregated and modeled data ready for consumption
+
+
+  # ── Lake Formation permissions ───────────────────────────────────────────────
+
+  LFPermissionGlueRaw:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: LakeFormationSettings
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueServiceRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseRaw
+      Permissions:
+        - ALL
+      PermissionsWithGrantOption: []
+
+  LFPermissionGlueTransactions:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: LakeFormationSettings
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueServiceRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseTransactions
+      Permissions:
+        - ALL
+      PermissionsWithGrantOption: []
+
+  LFPermissionGlueAnalytics:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: LakeFormationSettings
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueServiceRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseAnalytics
+      Permissions:
+        - ALL
+      PermissionsWithGrantOption: []
+
+  LFPermissionAnalyticsRaw:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: LakeFormationSettings
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt AnalyticsRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseRaw
+      Permissions:
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+  LFPermissionAnalyticsTransactions:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: LakeFormationSettings
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt AnalyticsRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseTransactions
+      Permissions:
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+  LFPermissionAnalyticsGold:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: LakeFormationSettings
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt AnalyticsRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseAnalytics
+      Permissions:
+        - DESCRIBE
+        - CREATE_TABLE
+      PermissionsWithGrantOption: []
+
+  # ── Athena ───────────────────────────────────────────────────────────────────
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: dev-lakehouse
+      Description: Athena workgroup for lakehouse queries
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${LakehouseBucket}/tmp/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240
+
+Outputs:
+
+  BucketName:
+    Description: Lakehouse S3 bucket
+    Value: !Ref LakehouseBucket
+    Export:
+      Name: dev-lakehouse-bucket
+
+  BucketArn:
+    Description: Lakehouse S3 bucket ARN
+    Value: !GetAtt LakehouseBucket.Arn
+    Export:
+      Name: dev-lakehouse-bucket-arn
+
+  RawDatabaseName:
+    Description: Glue database — Bronze/raw layer
+    Value: !Ref GlueDatabaseRaw
+    Export:
+      Name: dev-db-raw
+
+  TransactionsDatabaseName:
+    Description: Glue database — Silver/transactions layer
+    Value: !Ref GlueDatabaseTransactions
+    Export:
+      Name: dev-db-transactions
+
+  AnalyticsDatabaseName:
+    Description: Glue database — Gold/analytics layer
+    Value: !Ref GlueDatabaseAnalytics
+    Export:
+      Name: dev-db-analytics
+
+  GlueServiceRoleArn:
+    Description: IAM role ARN for Glue jobs and crawlers
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: dev-glue-role-arn
+
+  AnalyticsRoleArn:
+    Description: IAM role ARN for Athena consumers
+    Value: !GetAtt AnalyticsRole.Arn
+    Export:
+      Name: dev-analytics-role-arn
+
+  AthenaWorkgroupName:
+    Description: Athena workgroup name
+    Value: !Ref AthenaWorkgroup
+    Export:
+      Name: dev-athena-workgroup
+
+  GlueNetworkConnectionName:
+    Description: Glue network connection name — add this to create_job_kwargs Connections list in DAGs
+    Value: !Ref GlueNetworkConnection
+    Export:
+      Name: dev-glue-network-connection
+
+  GlueSecurityGroupId:
+    Description: Security group ID for Glue jobs
+    Value: !Ref GlueSecurityGroup
+    Export:
+      Name: dev-glue-sg-id
