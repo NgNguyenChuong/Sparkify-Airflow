@@ -7,14 +7,18 @@ from airflow.providers.common.sql.operators.sql import SQLCheckOperator
 
 
 CWD = Path(__file__).parent
+
 S3_BUCKET = "{{ var.value.s3_bucket }}"
 LANDING_PREFIX = "data_intervals"
 WAREHOUSE_LOCATION = f"s3://{S3_BUCKET}/iceberg-warehouse/"
 ICEBERG_SCRIPT = CWD / "glue_script.py"
+
 AWS_CONN_ID = "aws_default"
 ATHENA_CONN_ID = "athena_default"
+
 GLUE_ROLE_NAME = "dev-lakehouse-glue-role"
 GLUE_CONNECTION_NAME = "dev-glue-network"
+
 REGION = "us-east-1"
 
 RAW_INGESTION_PENDING = Asset("raw_ingestion_pending")
@@ -26,11 +30,13 @@ with DAG(
     schedule=[RAW_INGESTION_PENDING],
     max_active_runs=1,
     max_active_tasks=2,
+    catchup=False,
 ) as dag:
 
     @task(inlets=[RAW_INGESTION_PENDING])
-    def capture_landing_keys(s3_bucket: str, *, inlet_events) -> list[str]:
+    def capture_landing_keys(s3_bucket: str, *, inlet_events) -> list[dict]:
         events = inlet_events[RAW_INGESTION_PENDING]
+
         if not events:
             raise ValueError("No raw ingestion asset events found.")
 
@@ -38,6 +44,7 @@ with DAG(
         interval_prefix = f"{LANDING_PREFIX}/{data_interval}/"
 
         hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+
         table_prefixes = hook.list_prefixes(
             bucket_name=s3_bucket,
             prefix=interval_prefix,
@@ -45,11 +52,29 @@ with DAG(
         ) or []
 
         if not table_prefixes:
-            raise ValueError(f"No source tables found under s3://{s3_bucket}/{interval_prefix}")
+            raise ValueError(
+                f"No source tables found under s3://{s3_bucket}/{interval_prefix}"
+            )
 
-        return sorted(table_prefixes)
+        glue_jobs = []
 
-    table_keys = capture_landing_keys(S3_BUCKET)
+        for key in sorted(table_prefixes):
+            table_name = key.strip("/").split("/")[-1]
+
+            glue_jobs.append(
+                {
+                    "job_name": f"ingest_raw_{table_name}",
+                    "script_args": {
+                        "--table": table_name,
+                        "--landing_path": f"s3://{s3_bucket}/{key}",
+                        "--data_interval": data_interval,
+                    },
+                }
+            )
+
+        return glue_jobs
+
+    table_jobs = capture_landing_keys(S3_BUCKET)
 
     submit_glue_jobs = GlueJobOperator.partial(
         task_id="ingest",
@@ -79,48 +104,35 @@ with DAG(
                 ),
             },
         },
-    ).expand_kwargs(
-        table_keys.map(
-            lambda key: {
-                "job_name": f"ingest_raw_{key.strip('/').split('/')[-1]}",
-                "script_args": {
-                    "--table": key.strip("/").split("/")[-1],
-                    "--landing_path": f"s3://{S3_BUCKET}/{key}",
-                    "--data_interval": (
-                        "{{ triggering_asset_events.for_asset(name='raw_ingestion_pending')"
-                        "[-1].extra['data_interval'] }}"
-                    ),
-                },
-            }
-        )
-    )
+    ).expand_kwargs(table_jobs)
 
     with TaskGroup("validate_raw") as validate_raw:
         SQLCheckOperator.partial(
             task_id="table_has_rows",
             conn_id=ATHENA_CONN_ID,
         ).expand_kwargs(
-            table_keys.map(
-                lambda key: {
+            table_jobs.map(
+                lambda job: {
                     "sql": f"""
-                        SELECT COUNT(*) FROM raw.{key.strip('/').split('/')[-1]}
-                        WHERE data_interval = '{{{{ triggering_asset_events.for_asset(name='raw_ingestion_pending')[-1].extra['data_interval'] }}}}'
+                        SELECT CASE WHEN COUNT(*) > 0 THEN 1 ELSE 0 END
+                        FROM raw.{job["script_args"]["--table"]}
+                        WHERE data_interval = '{job["script_args"]["--data_interval"]}'
                     """,
                 }
             )
         )
 
-    @task(inlets=[RAW_INGESTION_PENDING], outlets=[RAW_INGESTION_COMPLETE])
-    def notify_complete(table_prefixes: list[str], *, inlet_events, **context) -> None:
-        events = inlet_events[RAW_INGESTION_PENDING]
-        if not events:
-            raise ValueError("No raw ingestion asset events found.")
+    @task(outlets=[RAW_INGESTION_COMPLETE])
+    def notify_complete(table_jobs: list[dict], **context) -> None:
+        if not table_jobs:
+            raise ValueError("No table jobs were produced.")
 
-        data_interval = events[-1].extra["data_interval"]
-        tables = [key.strip("/").split("/")[-1] for key in table_prefixes]
+        data_interval = table_jobs[0]["script_args"]["--data_interval"]
+        tables = [job["script_args"]["--table"] for job in table_jobs]
+
         context["outlet_events"][RAW_INGESTION_COMPLETE].extra = {
             "data_interval": data_interval,
             "tables": tables,
         }
 
-    submit_glue_jobs >> validate_raw >> notify_complete(table_keys)
+    submit_glue_jobs >> validate_raw >> notify_complete(table_jobs)
