@@ -1,2 +1,0 @@
-﻿apache-airflow-providers-amazon
-apache-airflow-providers-common-sql
