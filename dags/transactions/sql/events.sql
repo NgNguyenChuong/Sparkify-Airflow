@@ -5,25 +5,25 @@
 WITH plays AS (
     SELECT
         SHA2(CONCAT_WS(':',
-            CAST(userid          AS STRING),
-            CAST(sessionid       AS STRING),
-            CAST(iteminsession   AS STRING)
+            CAST(user_id          AS STRING),
+            CAST(session_id       AS STRING),
+            CAST(item_in_session  AS STRING)
         ), 256)                                                AS event_id,
         CAST(from_unixtime(ts / 1000) AS TIMESTAMP)            AS ts,
-        CAST(userid    AS BIGINT)                              AS user_id,
-        CAST(sessionid AS BIGINT)                              AS session_id,
-        CAST(iteminsession AS INT)                             AS item_in_session,
+        CAST(user_id AS BIGINT)                                AS user_id,
+        CAST(session_id AS BIGINT)                             AS session_id,
+        CAST(item_in_session AS INT)                           AS item_in_session,
         artist                                                 AS artist_name_raw,
         song                                                   AS song_title_raw,
         CAST(length     AS DOUBLE)                             AS length,
         level,
         location,
-        useragent                                    AS user_agent,
+        user_agent                                   AS user_agent,
         CAST(from_unixtime(ts / 1000) AS DATE)       AS event_date
     FROM iceberg.raw.logs
     WHERE page    = 'NextSong'
-      AND userid IS NOT NULL
-      AND userid <> ''
+      AND user_id IS NOT NULL
+      AND user_id <> ''
       AND song    IS NOT NULL
       AND artist  IS NOT NULL
       AND length  IS NOT NULL
@@ -49,12 +49,14 @@ resolved AS (
             ORDER BY ABS(sv.duration - p.length) ASC
         ) AS rn
     FROM plays p
-    LEFT JOIN iceberg.transactions.songs   s
+    INNER JOIN iceberg.transactions.users u
+           ON u.user_id = p.user_id
+    INNER JOIN iceberg.transactions.songs s
            ON s.title = p.song_title_raw
-    LEFT JOIN iceberg.transactions.artists a
+    INNER JOIN iceberg.transactions.artists a
            ON a.artist_id   = s.artist_id
           AND a.artist_name = p.artist_name_raw
-    LEFT JOIN iceberg.transactions.song_versions sv
+    INNER JOIN iceberg.transactions.song_versions sv
            ON sv.song_id  = s.song_id
           AND ABS(sv.duration - p.length) < 0.01
 )

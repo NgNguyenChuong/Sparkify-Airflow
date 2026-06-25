@@ -3,7 +3,7 @@
 -- and an initial 'seed' row from each user's first event.
 WITH transitions AS (
     SELECT
-        CAST(userid AS BIGINT)              AS user_id,
+        CAST(user_id AS BIGINT)              AS user_id,
         CAST(from_unixtime(ts / 1000) AS TIMESTAMP) AS changed_at,
         CASE
             WHEN page = 'Submit Upgrade'   THEN 'paid'
@@ -11,8 +11,8 @@ WITH transitions AS (
         END                                  AS new_level,
         'transition'                         AS source
     FROM iceberg.raw.logs
-    WHERE userid IS NOT NULL
-      AND userid <> ''
+    WHERE user_id IS NOT NULL
+      AND user_id <> ''
       AND page IN ('Submit Upgrade', 'Submit Downgrade')
       AND data_interval = '{{ ti.xcom_pull(task_ids="metadata")["data_interval"] }}'
 ),
@@ -24,18 +24,19 @@ initial_seed AS (
         'initial' AS source
     FROM (
         SELECT
-            CAST(userid AS BIGINT)       AS user_id,
+            CAST(user_id AS BIGINT)       AS user_id,
             CAST(from_unixtime(ts / 1000) AS TIMESTAMP) AS changed_at,
             level                        AS new_level,
             ROW_NUMBER() OVER (
-                PARTITION BY userid
+                PARTITION BY user_id
                 ORDER BY ts ASC
             ) AS rn
         FROM iceberg.raw.logs
-        WHERE userid IS NOT NULL
-          AND userid <> ''
+        WHERE user_id IS NOT NULL
+          AND user_id <> ''
           AND auth = 'Logged In'
           AND level IS NOT NULL
+          AND data_interval <= '{{ ti.xcom_pull(task_ids="metadata")["data_interval"] }}'
     )
     WHERE rn = 1
 ),

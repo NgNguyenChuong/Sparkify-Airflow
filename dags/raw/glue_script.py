@@ -1,3 +1,4 @@
+import re
 import sys
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -49,13 +50,52 @@ if df.rdd.isEmpty():
     job.commit()
     sys.exit(0)
 
+# Normalize every discovered source field without hardcoding a table schema.
+# This keeps raw tables aligned with the documented snake_case column names
+# while still allowing new source tables and columns to flow through unchanged.
+def to_snake_case(column_name):
+    value = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", column_name)
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return value.lower()
+
+
+source_columns = df.columns
+normalized_columns = [to_snake_case(column) for column in source_columns]
+if len(normalized_columns) != len(set(normalized_columns)):
+    raise ValueError(
+        f"Column normalization produced duplicate names for table {table}: "
+        f"{normalized_columns}"
+    )
+
+df = df.toDF(*normalized_columns)
+
 # Add data_interval column to the dataframe
 df = df.withColumn("data_interval", F.lit(data_interval))
 
 # ── Write to Iceberg ────────────────────────────────────────────────────────────
 
 # Check if the table exists
-if not spark.catalog.tableExists(ICEBERG_TABLE):
+table_exists = spark.catalog.tableExists(ICEBERG_TABLE)
+
+if table_exists:
+    # Migrate previously created raw tables to the normalized field names.
+    # The mapping is derived from the discovered schema, so reruns require no
+    # hardcoded source columns or manual table cleanup.
+    target_columns = set(spark.table(ICEBERG_TABLE).columns)
+    for source_column, normalized_column in zip(source_columns, normalized_columns):
+        if (
+            source_column != normalized_column
+            and source_column in target_columns
+            and normalized_column not in target_columns
+        ):
+            spark.sql(
+                f"ALTER TABLE {ICEBERG_TABLE} "
+                f"RENAME COLUMN `{source_column}` TO `{normalized_column}`"
+            )
+            target_columns.remove(source_column)
+            target_columns.add(normalized_column)
+
+if not table_exists:
 
     # If the table doesn't exists create the table and write 
     # the raw data to it using iceberg
