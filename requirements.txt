@@ -1,0 +1,5 @@
+apache-airflow-providers-amazon
+boto3
+botocore
+jinja2
+pendulum
