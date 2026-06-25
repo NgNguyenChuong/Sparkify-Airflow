@@ -178,6 +178,7 @@ with DAG(
         SQLCheckOperator.partial(
             task_id="table_has_rows",
             conn_id=ATHENA_CONN_ID,
+            hook_params={"aws_conn_id": AWS_CONN_ID},
         ).expand_kwargs(
             table_keys.map(lambda job: {
                 "sql": f"""
