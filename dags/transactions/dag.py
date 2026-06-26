@@ -206,6 +206,7 @@ with DAG(
             SQLCheckOperator(
                 task_id=f"check_{table_name}_primary_key",
                 conn_id=ATHENA_CONN_ID,
+                hook_params={"aws_conn_id": AWS_CONN_ID},
                 trigger_rule="none_failed_min_one_success",
                 sql=f"""
                 SELECT CASE
@@ -225,6 +226,7 @@ with DAG(
         SQLCheckOperator(
             task_id="check_events_version_resolution",
             conn_id=ATHENA_CONN_ID,
+            hook_params={"aws_conn_id": AWS_CONN_ID},
             trigger_rule="none_failed_min_one_success",
             sql="""
             SELECT CASE
